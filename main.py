@@ -14,6 +14,9 @@ from models import Base
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from auth import validate_auth_config
+    validate_auth_config()
+
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
@@ -36,7 +39,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from auth import router as auth_router  # noqa: E402
 from routes import router  # noqa: E402
+app.include_router(auth_router)
 app.include_router(router)
 
 if __name__ == "__main__":

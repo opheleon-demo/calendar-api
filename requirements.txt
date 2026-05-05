@@ -3,3 +3,5 @@ uvicorn[standard]>=0.29
 sqlalchemy>=2.0
 pytz>=2024.1
 pydantic>=2.6
+PyJWT>=2.10
+pwdlib[argon2]>=0.2

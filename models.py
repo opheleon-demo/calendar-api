@@ -6,7 +6,7 @@ from sqlalchemy import (
     create_engine, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── SQLAlchemy ORM ──────────────────────────────────────────────────────────
@@ -32,6 +32,15 @@ class Event(Base):
     exceptions = relationship(
         "RecurrenceException", back_populates="event", cascade="all, delete-orphan"
     )
+
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class RecurrenceRule(Base):
@@ -100,6 +109,22 @@ class SeriesUpdate(BaseModel):
     start: Optional[str] = None      # new time-of-day
     end: Optional[str] = None
     from_date: str                   # ISO date: split point
+
+
+class UserRegister(BaseModel):
+    username: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=8)
+
+
+class UserLogin(BaseModel):
+    username: str = Field(min_length=1, max_length=150)
+    password: str = Field(min_length=1)
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
 
 
 class EventResponse(BaseModel):

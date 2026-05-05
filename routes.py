@@ -11,6 +11,7 @@ import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from auth import get_current_user
 from database import get_db
 from models import (
     Event, RecurrenceRule, RecurrenceException,
@@ -23,7 +24,7 @@ from interval_tree import Interval
 from conflict import detect_conflicts_for_event
 from series import split_series
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

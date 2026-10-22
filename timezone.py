@@ -1,16 +1,20 @@
 """
-DST-aware timezone arithmetic using binary search over pytz transition tables.
+DST-aware timezone arithmetic on top of the stdlib zoneinfo database.
 
-Instead of delegating to pytz.localize(), we extract the raw transition timestamps
-and UTC offsets, then use bisect for O(log T) lookups. This gives us explicit
-control over ambiguous (fall-back) and gap (spring-forward) times.
+zoneinfo applies each zone's POSIX rule after the last explicit transition, so
+recurrences far in the future keep the right offset. Gap (spring-forward) and
+ambiguous (fall-back) local times are resolved explicitly:
+
+- ambiguous: prefer_dst=True picks the earlier UTC instant (DST side)
+- gap: snaps forward to the transition instant (first valid local time)
 """
 from __future__ import annotations
 import datetime as dt
-from bisect import bisect_right
+from functools import lru_cache
 from typing import NamedTuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import pytz
+_UTC = dt.timezone.utc
 
 
 class ConversionResult(NamedTuple):
@@ -19,123 +23,83 @@ class ConversionResult(NamedTuple):
     is_gap: bool
 
 
-def _get_transitions(tz_name: str):
-    """Extract sorted UTC transition timestamps and their resulting offsets."""
-    tz = pytz.timezone(tz_name)
-    if not hasattr(tz, "_utc_transition_times"):
-        # Fixed-offset zone (e.g. UTC) — no transitions
-        offset = tz.utcoffset(dt.datetime(2020, 1, 1))
-        return [], [], offset
-    trans_utc = [t.replace(tzinfo=None) for t in tz._utc_transition_times]
-    trans_timestamps = [int(t.replace(tzinfo=dt.timezone.utc).timestamp()) for t in trans_utc]
-    offsets = []
-    for info in tz._transition_info:
-        utcoff, dst_off, abbr = info
-        offsets.append(utcoff)
-    default = tz._transition_info[0][0] if tz._transition_info else dt.timedelta(0)
-    return trans_timestamps, offsets, default
+class InvalidTimezone(ValueError):
+    pass
 
 
-_tz_cache: dict[str, tuple] = {}
+@lru_cache(maxsize=256)
+def get_zone(tz_name: str) -> ZoneInfo:
+    """Return the ZoneInfo for tz_name or raise InvalidTimezone."""
+    if not isinstance(tz_name, str) or not tz_name or tz_name != tz_name.strip():
+        raise InvalidTimezone(f"Unknown time zone: {tz_name!r}")
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        raise InvalidTimezone(f"Unknown time zone: {tz_name!r}") from None
 
 
-def _cached_tz(tz_name: str):
-    if tz_name not in _tz_cache:
-        _tz_cache[tz_name] = _get_transitions(tz_name)
-    return _tz_cache[tz_name]
+def validate_timezone(tz_name: str) -> str:
+    get_zone(tz_name)
+    return tz_name
 
 
 def utc_to_local(utc_dt: dt.datetime, tz_name: str) -> dt.datetime:
-    """Convert a UTC datetime to local wall-clock time. O(log T) via binary search."""
-    trans_ts, offsets, default_off = _cached_tz(tz_name)
-    ts = int(utc_dt.replace(tzinfo=dt.timezone.utc).timestamp())
+    """Convert a naive UTC datetime to naive local wall-clock time."""
+    return utc_dt.replace(tzinfo=_UTC).astimezone(get_zone(tz_name)).replace(tzinfo=None)
 
-    if not trans_ts:
-        return utc_dt + default_off
 
-    idx = bisect_right(trans_ts, ts) - 1
-    if idx < 0:
-        offset = default_off
-    else:
-        offset = offsets[idx]
-
-    return utc_dt + offset
+def _to_utc(local_naive: dt.datetime, zone: ZoneInfo, fold: int) -> dt.datetime:
+    return local_naive.replace(tzinfo=zone, fold=fold).astimezone(_UTC).replace(tzinfo=None)
 
 
 def local_to_utc(local_naive: dt.datetime, tz_name: str, prefer_dst: bool = True) -> ConversionResult:
+    """Convert a naive local datetime to naive UTC, resolving gaps and ambiguities."""
+    zone = get_zone(tz_name)
+    early = _to_utc(local_naive, zone, fold=0)
+    late = _to_utc(local_naive, zone, fold=1)
+    early_ok = utc_to_local(early, tz_name) == local_naive
+    late_ok = utc_to_local(late, tz_name) == local_naive
+
+    if early_ok and late_ok and early != late:
+        pick = min(early, late) if prefer_dst else max(early, late)
+        return ConversionResult(pick, True, False)
+    if early_ok or late_ok:
+        return ConversionResult(early if early_ok else late, False, False)
+
+    # Gap: the transition lies between the two candidate instants. Binary
+    # search for the first instant whose local time is past the gap.
+    lo, hi = min(early, late), max(early, late)
+    while hi - lo > dt.timedelta(seconds=1):
+        mid = lo + (hi - lo) / 2
+        if utc_to_local(mid, tz_name) >= local_naive:
+            hi = mid
+        else:
+            lo = mid
+    snapped = hi.replace(microsecond=0)
+    if utc_to_local(snapped, tz_name) < local_naive:
+        snapped += dt.timedelta(seconds=1)
+    return ConversionResult(snapped, False, True)
+
+
+def parse_datetime(value: str) -> dt.datetime:
+    """Parse an ISO 8601 datetime; raises ValueError on bad input."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("Datetime must be a non-empty ISO 8601 string")
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(text)
+    return parsed
+
+
+def localize_and_convert(iso_value: str, tz_name: str) -> dt.datetime:
     """
-    Convert a naive local datetime to UTC. Handles gaps and ambiguities.
+    Parse an ISO string and return a naive UTC datetime.
 
-    For ambiguous times (fall-back): prefer_dst=True picks the DST offset (earlier UTC),
-    prefer_dst=False picks the standard offset (later UTC).
-
-    For gap times (spring-forward): shifts forward to the first valid time after the gap.
-
-    Returns a ConversionResult with the resolved UTC datetime and flags.
+    Naive values are interpreted as wall-clock time in tz_name; values with an
+    explicit offset are converted directly.
     """
-    trans_ts, offsets, default_off = _cached_tz(tz_name)
-
-    if not trans_ts:
-        return ConversionResult(local_naive - default_off, False, False)
-
-    # The local time `lt` maps to UTC `lt - offset`. But the correct offset depends
-    # on which period we're in (which depends on UTC). We try all candidate periods.
-    local_ts = int(local_naive.replace(tzinfo=dt.timezone.utc).timestamp())
-
-    candidates = []
-    # Check default period (before first transition)
-    utc_cand = local_ts - int(default_off.total_seconds())
-    if utc_cand < trans_ts[0]:
-        candidates.append((utc_cand, default_off))
-
-    for i in range(len(trans_ts)):
-        offset = offsets[i]
-        utc_cand = local_ts - int(offset.total_seconds())
-        period_start = trans_ts[i]
-        period_end = trans_ts[i + 1] if i + 1 < len(trans_ts) else float("inf")
-        if period_start <= utc_cand < period_end:
-            candidates.append((utc_cand, offset))
-
-    if len(candidates) == 1:
-        utc_ts, _ = candidates[0]
-        return ConversionResult(
-            dt.datetime.fromtimestamp(utc_ts, tz=dt.timezone.utc).replace(tzinfo=None),
-            False, False,
-        )
-
-    if len(candidates) == 2:
-        # Ambiguous: two valid UTC interpretations (fall-back)
-        candidates.sort()
-        # Earlier UTC = DST side, later UTC = standard side
-        pick = candidates[0] if prefer_dst else candidates[1]
-        return ConversionResult(
-            dt.datetime.fromtimestamp(pick[0], tz=dt.timezone.utc).replace(tzinfo=None),
-            True, False,
-        )
-
-    # Zero candidates: gap (spring-forward)
-    # Find the transition that caused the gap and snap to it
-    for i in range(len(trans_ts)):
-        off_before = offsets[i - 1] if i > 0 else default_off
-        off_after = offsets[i]
-        gap_local_start = trans_ts[i] + int(off_before.total_seconds())
-        gap_local_end = trans_ts[i] + int(off_after.total_seconds())
-        if gap_local_start <= local_ts < gap_local_end:
-            # Snap forward to the end of the gap
-            utc_snap = trans_ts[i]
-            return ConversionResult(
-                dt.datetime.fromtimestamp(utc_snap, tz=dt.timezone.utc).replace(tzinfo=None),
-                False, True,
-            )
-
-    # Fallback: shouldn't reach here; use pytz as safety net
-    tz = pytz.timezone(tz_name)
-    localized = tz.localize(local_naive, is_dst=prefer_dst)
-    return ConversionResult(localized.astimezone(pytz.utc).replace(tzinfo=None), False, False)
-
-
-def localize_and_convert(naive_iso: str, tz_name: str) -> dt.datetime:
-    """Parse an ISO string as local time in tz_name, return UTC naive datetime."""
-    local_naive = dt.datetime.fromisoformat(naive_iso)
-    result = local_to_utc(local_naive, tz_name)
-    return result.utc_dt
+    parsed = parse_datetime(iso_value)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(_UTC).replace(tzinfo=None)
+    return local_to_utc(parsed, tz_name).utc_dt

@@ -1,31 +1,25 @@
 """
 FastAPI application entry point.
 
-Creates tables, seeds data on first run, and mounts routes.
+Creates/migrates tables and mounts routes. No sample data is seeded: every
+event belongs to a registered user (see seed.py for opt-in demo data).
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
 
-from database import engine, SessionLocal
-from models import Base
+from database import engine
+from migrations import run_migrations
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from auth import validate_auth_config
     validate_auth_config()
-
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
-    try:
-        from models import Event
-        if db.query(Event).count() == 0:
-            from seed import seed_database
-            seed_database(db)
-    finally:
-        db.close()
+    run_migrations(engine)
     yield
 
 
@@ -38,6 +32,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def database_error_handler(request: Request, exc: SQLAlchemyError):
+    # The request's session is rolled back and closed by get_db.
+    return JSONResponse(status_code=500, content={"detail": "Database error; nothing was changed"})
+
 
 from auth import router as auth_router  # noqa: E402
 from routes import router  # noqa: E402

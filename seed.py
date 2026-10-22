@@ -1,5 +1,8 @@
 """
-Seed data: a few single events and 2-3 recurring events with exceptions.
+Opt-in demo data: a few single events and 2-3 recurring events with exceptions,
+owned by one existing account. Never run automatically:
+
+    python seed.py USERNAME
 
 Demonstrates DST crossings (standup crosses March spring-forward),
 exception modifications, and exception deletions.
@@ -7,14 +10,15 @@ exception modifications, and exception deletions.
 import datetime as dt
 from sqlalchemy.orm import Session
 
-from models import Event, RecurrenceRule, RecurrenceException
+from models import Event, RecurrenceRule, RecurrenceException, User
 from timezone import local_to_utc
 
 
-def seed_database(db: Session) -> None:
+def seed_database(db: Session, owner: User) -> None:
     # ── 1. Single event: Team Lunch ─────────────────────────────────────
     lunch_start = local_to_utc(dt.datetime(2026, 4, 1, 12, 0), "America/New_York").utc_dt
     lunch = Event(
+        owner_id=owner.id,
         title="Team Lunch",
         start_utc=lunch_start,
         end_utc=lunch_start + dt.timedelta(hours=1),
@@ -26,6 +30,7 @@ def seed_database(db: Session) -> None:
     # ── 2. Single event: Dentist ────────────────────────────────────────
     dentist_start = local_to_utc(dt.datetime(2026, 4, 3, 10, 0), "America/New_York").utc_dt
     dentist = Event(
+        owner_id=owner.id,
         title="Dentist Appointment",
         start_utc=dentist_start,
         end_utc=dentist_start + dt.timedelta(hours=1, minutes=30),
@@ -40,6 +45,7 @@ def seed_database(db: Session) -> None:
     # the 9am wall-clock time; the UTC offset shifts automatically.
     standup_start = local_to_utc(dt.datetime(2026, 1, 5, 9, 0), "America/New_York").utc_dt
     standup = Event(
+        owner_id=owner.id,
         title="Daily Standup",
         start_utc=standup_start,
         end_utc=standup_start + dt.timedelta(minutes=30),
@@ -60,6 +66,7 @@ def seed_database(db: Session) -> None:
     # Exception: April 1st moved to April 2nd at 3pm
     retro_start = local_to_utc(dt.datetime(2026, 1, 1, 14, 0), "America/New_York").utc_dt
     retro = Event(
+        owner_id=owner.id,
         title="Monthly Retrospective",
         start_utc=retro_start,
         end_utc=retro_start + dt.timedelta(hours=1),
@@ -92,6 +99,7 @@ def seed_database(db: Session) -> None:
     # Exception: Feb 5 occurrence deleted
     oneone_start = local_to_utc(dt.datetime(2026, 1, 8, 15, 0), "America/Los_Angeles").utc_dt
     oneone = Event(
+        owner_id=owner.id,
         title="1:1 with Manager",
         start_utc=oneone_start,
         end_utc=oneone_start + dt.timedelta(minutes=45),
@@ -117,3 +125,19 @@ def seed_database(db: Session) -> None:
     db.add(oneone_exc)
 
     db.commit()
+
+
+if __name__ == "__main__":
+    import sys
+    from database import SessionLocal, engine
+    from migrations import run_migrations
+
+    if len(sys.argv) != 2:
+        sys.exit("usage: python seed.py USERNAME")
+    run_migrations(engine)
+    with SessionLocal() as session:
+        user = session.query(User).filter(User.username == sys.argv[1]).first()
+        if user is None:
+            sys.exit(f"No user named {sys.argv[1]!r}")
+        seed_database(session, user)
+    print(f"Seeded demo events for {sys.argv[1]}")

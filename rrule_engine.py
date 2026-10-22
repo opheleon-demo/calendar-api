@@ -48,9 +48,14 @@ class RRule:
     bymonthday: Optional[list[int]] = None; bymonth: Optional[list[int]] = None
 
 def expand(rule: RRule, ws: dt.datetime, we: dt.datetime) -> list[dt.datetime]:
-    """Expand RRULE into occurrences within [ws, we). Skip-ahead, never iterates from dtstart."""
+    """Expand RRULE into occurrences within [ws, we). Skip-ahead, never iterates from dtstart.
+
+    UNTIL is inclusive: an occurrence exactly at UNTIL is produced, nothing after it.
+    """
     gen = {"DAILY": _daily, "WEEKLY": _weekly, "MONTHLY": _monthly, "YEARLY": _yearly}[rule.freq]
-    eff_end = min(we, rule.until + dt.timedelta(days=1)) if rule.until else we
+    eff_end = min(we, rule.until + dt.timedelta(microseconds=1)) if rule.until else we
+    if eff_end <= ws:
+        return []
     raw = gen(rule, ws, eff_end)
     if rule.count is not None:
         pre = len(gen(rule, rule.dtstart, ws))
@@ -100,8 +105,8 @@ def _monthly(rule: RRule, ws: dt.datetime, we: dt.datetime) -> list[dt.datetime]
     elif mi < ws_mi: mi += rule.interval
     while True:
         y, m = mi // 12, mi % 12 + 1
+        if dt.datetime(y, m, 1) >= we: break
         if rule.bymonth and m not in rule.bymonth: mi += rule.interval; continue
-        if dt.datetime(y, m, 1) >= we + dt.timedelta(days=31): break
         for d in _month_days(rule, y, m, ds):
             occ = dt.datetime(y, m, d, t.hour, t.minute, t.second)
             if occ < ds: continue

@@ -26,3 +26,10 @@ Seeds sample events automatically on first run.
 - `DELETE /events/:id` — Delete event or entire series
 
 All `/events` endpoints require `Authorization: Bearer <token>`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```

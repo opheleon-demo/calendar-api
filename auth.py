@@ -72,7 +72,12 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
     try:
-        payload = jwt.decode(token, _get_jwt_secret_key(), algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            _get_jwt_secret_key(),
+            algorithms=[JWT_ALGORITHM],
+            options={"require": ["exp", "sub"]},
+        )
         user_id = int(payload.get("sub", ""))
     except (InvalidTokenError, TypeError, ValueError):
         raise _auth_error()

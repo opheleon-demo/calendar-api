@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from auth import get_current_user
 from database import get_db
 from models import (
-    Event, RecurrenceRule, RecurrenceException,
+    Event, User, RecurrenceRule, RecurrenceException,
     EventCreate, EventUpdate, OccurrenceUpdate, SeriesUpdate,
     EventResponse, ConflictInfo,
 )
@@ -28,6 +28,14 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _get_owned_event(db: Session, event_id: int, user: User) -> Event:
+    """Load an event owned by `user`, or 404 without revealing whether it exists."""
+    event = db.query(Event).filter(Event.id == event_id, Event.owner_id == user.id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+    return event
+
 
 def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) -> list[EventResponse]:
     """Expand a recurring event into individual occurrences within a UTC range."""
@@ -110,12 +118,17 @@ def _event_to_intervals(event: Event, start_utc: dt.datetime, end_utc: dt.dateti
 # ── POST /events ────────────────────────────────────────────────────────────
 
 @router.post("/events")
-def create_event(body: EventCreate, db: Session = Depends(get_db)):
+def create_event(
+    body: EventCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     tz_name = body.timezone
     start_utc = localize_and_convert(body.start, tz_name)
     end_utc = localize_and_convert(body.end, tz_name)
 
     event = Event(
+        owner_id=current_user.id,
         title=body.title,
         start_utc=start_utc,
         end_utc=end_utc,
@@ -148,7 +161,11 @@ def create_event(body: EventCreate, db: Session = Depends(get_db)):
     window_end = start_utc + dt.timedelta(days=90)
     new_intervals = _event_to_intervals(event, start_utc, window_end)
 
-    existing_events = db.query(Event).filter(Event.id != event.id).all()
+    existing_events = (
+        db.query(Event)
+        .filter(Event.owner_id == current_user.id, Event.id != event.id)
+        .all()
+    )
     existing_intervals: list[Interval] = []
     for ev in existing_events:
         existing_intervals.extend(_event_to_intervals(ev, start_utc, window_end))
@@ -177,6 +194,7 @@ def get_events(
     end: str = Query(..., description="ISO date or datetime"),
     tz: str = Query("UTC"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     # Parse range
     try:
@@ -196,7 +214,10 @@ def get_events(
     # Non-recurring: SQL overlap query
     single_events = (
         db.query(Event)
-        .filter(Event.is_recurring == False, Event.start_utc < end_utc, Event.end_utc > start_utc)
+        .filter(
+            Event.owner_id == current_user.id,
+            Event.is_recurring == False, Event.start_utc < end_utc, Event.end_utc > start_utc,
+        )
         .all()
     )
     for ev in single_events:
@@ -210,7 +231,10 @@ def get_events(
     # Recurring: expand each one
     recurring_events = (
         db.query(Event)
-        .filter(Event.is_recurring == True, Event.start_utc <= end_utc)
+        .filter(
+            Event.owner_id == current_user.id,
+            Event.is_recurring == True, Event.start_utc <= end_utc,
+        )
         .all()
     )
     for ev in recurring_events:
@@ -223,10 +247,13 @@ def get_events(
 # ── PUT /events/:id ─────────────────────────────────────────────────────────
 
 @router.put("/events/{event_id}")
-def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def update_event(
+    event_id: int,
+    body: EventUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, current_user)
 
     if body.title is not None:
         event.title = body.title
@@ -248,10 +275,14 @@ def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)
 # ── PUT /events/:id/occurrence/:date ────────────────────────────────────────
 
 @router.put("/events/{event_id}/occurrence/{date_str}")
-def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def update_occurrence(
+    event_id: int,
+    date_str: str,
+    body: OccurrenceUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, current_user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -282,10 +313,13 @@ def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: 
 # ── PUT /events/:id/series ──────────────────────────────────────────────────
 
 @router.put("/events/{event_id}/series")
-def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def update_series(
+    event_id: int,
+    body: SeriesUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, current_user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -313,10 +347,13 @@ def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_d
 # ── DELETE /events/:id/occurrence/:date ─────────────────────────────────────
 
 @router.delete("/events/{event_id}/occurrence/{date_str}")
-def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def delete_occurrence(
+    event_id: int,
+    date_str: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, current_user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -345,10 +382,12 @@ def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db
 # ── DELETE /events/:id ──────────────────────────────────────────────────────
 
 @router.delete("/events/{event_id}")
-def delete_event(event_id: int, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def delete_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, current_user)
 
     db.delete(event)
     db.commit()

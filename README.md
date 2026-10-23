@@ -11,7 +11,32 @@ python3 main.py
 # → http://localhost:8000
 ```
 
-Seeds sample events automatically on first run.
+To add sample events to an account: `python3 seed.py --owner <username>`.
+
+## Event ownership
+
+Every event belongs to the account that created it; each person only sees and
+changes their own events, and another person's event IDs return 404.
+
+Events created before sign-in existed have no owner and are hidden until the
+ownership migration assigns them to one named account (which must already be
+registered):
+
+```bash
+LEGACY_EVENTS_OWNER=<username> python3 migrate_ownership.py   # or --owner <username>
+```
+
+It runs in one transaction, fails without changing anything if the account
+does not exist, only assigns events that have no owner (safe to rerun), and
+then makes `owner_id` required. When `LEGACY_EVENTS_OWNER` is set, the API
+also runs it at startup.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest tests
+```
 
 ## API
 

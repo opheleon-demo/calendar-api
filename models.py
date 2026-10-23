@@ -18,6 +18,7 @@ class Base(DeclarativeBase):
 class Event(Base):
     __tablename__ = "events"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     title = Column(String, nullable=False)
     start_utc = Column(DateTime, nullable=False)
     end_utc = Column(DateTime, nullable=False)
@@ -26,6 +27,7 @@ class Event(Base):
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
+    owner = relationship("User")
     recurrence_rule = relationship(
         "RecurrenceRule", back_populates="event", uselist=False, cascade="all, delete-orphan"
     )

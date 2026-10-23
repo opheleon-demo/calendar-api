@@ -3,18 +3,26 @@ Seed data: a few single events and 2-3 recurring events with exceptions.
 
 Demonstrates DST crossings (standup crosses March spring-forward),
 exception modifications, and exception deletions.
+
+Sample events always belong to an existing account:
+
+    python3 seed.py --owner alice
 """
+import argparse
 import datetime as dt
+import sys
+
 from sqlalchemy.orm import Session
 
-from models import Event, RecurrenceRule, RecurrenceException
+from models import Event, RecurrenceRule, RecurrenceException, User
 from timezone import local_to_utc
 
 
-def seed_database(db: Session) -> None:
+def seed_database(db: Session, owner: User) -> None:
     # ── 1. Single event: Team Lunch ─────────────────────────────────────
     lunch_start = local_to_utc(dt.datetime(2026, 4, 1, 12, 0), "America/New_York").utc_dt
     lunch = Event(
+        owner_id=owner.id,
         title="Team Lunch",
         start_utc=lunch_start,
         end_utc=lunch_start + dt.timedelta(hours=1),
@@ -26,6 +34,7 @@ def seed_database(db: Session) -> None:
     # ── 2. Single event: Dentist ────────────────────────────────────────
     dentist_start = local_to_utc(dt.datetime(2026, 4, 3, 10, 0), "America/New_York").utc_dt
     dentist = Event(
+        owner_id=owner.id,
         title="Dentist Appointment",
         start_utc=dentist_start,
         end_utc=dentist_start + dt.timedelta(hours=1, minutes=30),
@@ -40,6 +49,7 @@ def seed_database(db: Session) -> None:
     # the 9am wall-clock time; the UTC offset shifts automatically.
     standup_start = local_to_utc(dt.datetime(2026, 1, 5, 9, 0), "America/New_York").utc_dt
     standup = Event(
+        owner_id=owner.id,
         title="Daily Standup",
         start_utc=standup_start,
         end_utc=standup_start + dt.timedelta(minutes=30),
@@ -60,6 +70,7 @@ def seed_database(db: Session) -> None:
     # Exception: April 1st moved to April 2nd at 3pm
     retro_start = local_to_utc(dt.datetime(2026, 1, 1, 14, 0), "America/New_York").utc_dt
     retro = Event(
+        owner_id=owner.id,
         title="Monthly Retrospective",
         start_utc=retro_start,
         end_utc=retro_start + dt.timedelta(hours=1),
@@ -92,6 +103,7 @@ def seed_database(db: Session) -> None:
     # Exception: Feb 5 occurrence deleted
     oneone_start = local_to_utc(dt.datetime(2026, 1, 8, 15, 0), "America/Los_Angeles").utc_dt
     oneone = Event(
+        owner_id=owner.id,
         title="1:1 with Manager",
         start_utc=oneone_start,
         end_utc=oneone_start + dt.timedelta(minutes=45),
@@ -117,3 +129,29 @@ def seed_database(db: Session) -> None:
     db.add(oneone_exc)
 
     db.commit()
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Add sample events to an account's calendar")
+    parser.add_argument("--owner", required=True, help="Username that will own the sample events")
+    args = parser.parse_args(argv)
+
+    from database import SessionLocal, engine
+    from models import Base
+
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        owner = db.query(User).filter(User.username == args.owner.strip()).first()
+        if not owner:
+            print(f"Account '{args.owner}' does not exist; register it first.", file=sys.stderr)
+            return 1
+        seed_database(db, owner)
+    finally:
+        db.close()
+    print(f"Seeded sample events for '{args.owner}'")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

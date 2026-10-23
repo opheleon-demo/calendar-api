@@ -91,6 +91,7 @@ def split_series(
     new_end_utc = new_start_utc + new_duration
 
     new_event = Event(
+        owner_id=event.owner_id,
         title=new_title,
         start_utc=new_start_utc,
         end_utc=new_end_utc,

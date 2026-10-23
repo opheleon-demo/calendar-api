@@ -6,7 +6,7 @@ from sqlalchemy import (
     create_engine, func,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── SQLAlchemy ORM ──────────────────────────────────────────────────────────
@@ -111,14 +111,23 @@ class SeriesUpdate(BaseModel):
     from_date: str                   # ISO date: split point
 
 
+def _strip_username(value):
+    return value.strip() if isinstance(value, str) else value
+
+
 class UserRegister(BaseModel):
     username: str = Field(min_length=1, max_length=150)
     password: str = Field(min_length=8)
+
+    # Strip before length checks so a blank username is a per-field 422.
+    _strip = field_validator("username", mode="before")(_strip_username)
 
 
 class UserLogin(BaseModel):
     username: str = Field(min_length=1, max_length=150)
     password: str = Field(min_length=1)
+
+    _strip = field_validator("username", mode="before")(_strip_username)
 
 
 class TokenResponse(BaseModel):

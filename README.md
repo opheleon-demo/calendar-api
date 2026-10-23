@@ -13,6 +13,13 @@ python3 main.py
 
 Seeds sample events automatically on first run.
 
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m pytest
+```
+
 ## API
 
 - `POST /auth/register` — Create a user and receive a bearer JWT

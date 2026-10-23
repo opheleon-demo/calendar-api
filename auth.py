@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jwt import InvalidTokenError
 from pwdlib import PasswordHash
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from database import get_db
@@ -85,13 +86,7 @@ def get_current_user(
 
 @router.post("/register", response_model=TokenResponse)
 def register_user(body: UserRegister, db: Session = Depends(get_db)):
-    username = body.username.strip()
-    if not username or not body.password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username and password are required",
-        )
-
+    username = body.username
     existing_user = db.query(User).filter(User.username == username).first()
     if existing_user:
         raise HTTPException(
@@ -101,7 +96,15 @@ def register_user(body: UserRegister, db: Session = Depends(get_db)):
 
     user = User(username=username, password_hash=get_password_hash(body.password))
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # A concurrent registration claimed the username first.
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Username already exists",
+        )
     db.refresh(user)
 
     token, expires_in = create_access_token(user)
@@ -110,7 +113,7 @@ def register_user(body: UserRegister, db: Session = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 def login_user(body: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == body.username.strip()).first()
+    user = db.query(User).filter(User.username == body.username).first()
     if not user or not verify_password(body.password, user.password_hash):
         raise _auth_error()
 

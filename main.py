@@ -41,8 +41,10 @@ app.add_middleware(
 
 from auth import router as auth_router  # noqa: E402
 from routes import router  # noqa: E402
+from zoom import router as zoom_router  # noqa: E402
 app.include_router(auth_router)
 app.include_router(router)
+app.include_router(zoom_router)
 
 if __name__ == "__main__":
     import uvicorn

@@ -96,6 +96,7 @@ def split_series(
         end_utc=new_end_utc,
         timezone=tz_name,
         is_recurring=True,
+        owner_user_id=event.owner_user_id,
     )
     db.add(new_event)
     db.flush()  # Get new_event.id

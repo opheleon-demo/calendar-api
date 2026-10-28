@@ -4,20 +4,25 @@ All 7 API endpoints for the calendar service.
 Endpoints handle both single and recurring events. Recurring event expansion
 is done on-the-fly using the custom RRULE engine. Conflict detection uses
 the sweep line algorithm.
+
+Every query and mutation is scoped to the signed-in user, who is the event's
+organizer. Optional Zoom meetings follow the event (see zoom_meetings).
 """
 from __future__ import annotations
 import datetime as dt
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from auth import get_current_user
 from database import get_db
 from models import (
-    Event, RecurrenceRule, RecurrenceException,
+    Event, RecurrenceRule, RecurrenceException, User,
     EventCreate, EventUpdate, OccurrenceUpdate, SeriesUpdate,
-    EventResponse, ConflictInfo,
+    EventResponse, EventMutationResponse, ConflictInfo,
 )
+import zoom_meetings
 from rrule_engine import build_rrule, expand
 from timezone import utc_to_local, local_to_utc, localize_and_convert
 from interval_tree import Interval
@@ -28,6 +33,29 @@ router = APIRouter(dependencies=[Depends(get_current_user)])
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _owned_events(db: Session, user: User):
+    return db.query(Event).filter(Event.owner_user_id == user.id)
+
+
+def _get_owned_event(db: Session, event_id: int, user: User) -> Event:
+    """Load one of the user's events. Other users' events are reported as missing."""
+    event = _owned_events(db, user).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(404, "Event not found")
+    return event
+
+
+def _event_response(event: Event, response_cls=EventResponse, **extra):
+    return response_cls(
+        id=event.id, title=event.title,
+        start=event.start_utc.isoformat() + "Z",
+        end=event.end_utc.isoformat() + "Z",
+        timezone=event.timezone, is_recurring=event.is_recurring,
+        zoom_join_url=zoom_meetings.join_url(event),
+        **extra,
+    )
+
 
 def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) -> list[EventResponse]:
     """Expand a recurring event into individual occurrences within a UTC range."""
@@ -76,6 +104,7 @@ def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) ->
                 end=occ_end_utc.isoformat() + "Z",
                 timezone=tz_name, is_recurring=True,
                 original_date=occ_date.isoformat(), is_exception=True,
+                zoom_join_url=zoom_meetings.join_url(event),
             ))
         else:
             occ_utc = local_to_utc(occ_local, tz_name).utc_dt
@@ -85,6 +114,7 @@ def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) ->
                 end=(occ_utc + duration).isoformat() + "Z",
                 timezone=tz_name, is_recurring=True,
                 original_date=occ_date.isoformat(), is_exception=False,
+                zoom_join_url=zoom_meetings.join_url(event),
             ))
 
     return results
@@ -110,7 +140,16 @@ def _event_to_intervals(event: Event, start_utc: dt.datetime, end_utc: dt.dateti
 # ── POST /events ────────────────────────────────────────────────────────────
 
 @router.post("/events")
-def create_event(body: EventCreate, db: Session = Depends(get_db)):
+def create_event(
+    body: EventCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if body.idempotency_key:
+        existing = _owned_events(db, user).filter(Event.idempotency_key == body.idempotency_key).first()
+        if existing:
+            return _repeat_create_result(db, user, existing, body)
+
     tz_name = body.timezone
     start_utc = localize_and_convert(body.start, tz_name)
     end_utc = localize_and_convert(body.end, tz_name)
@@ -121,9 +160,17 @@ def create_event(body: EventCreate, db: Session = Depends(get_db)):
         end_utc=end_utc,
         timezone=tz_name,
         is_recurring=body.recurrence is not None,
+        owner_user_id=user.id,
+        idempotency_key=body.idempotency_key,
     )
-    db.add(event)
-    db.flush()
+    try:
+        db.add(event)
+        db.flush()
+    except IntegrityError:
+        # A concurrent request with the same idempotency key won the insert.
+        db.rollback()
+        existing = _owned_events(db, user).filter(Event.idempotency_key == body.idempotency_key).one()
+        return _repeat_create_result(db, user, existing, body)
 
     if body.recurrence:
         r = body.recurrence
@@ -148,25 +195,37 @@ def create_event(body: EventCreate, db: Session = Depends(get_db)):
     window_end = start_utc + dt.timedelta(days=90)
     new_intervals = _event_to_intervals(event, start_utc, window_end)
 
-    existing_events = db.query(Event).filter(Event.id != event.id).all()
+    existing_events = _owned_events(db, user).filter(Event.id != event.id).all()
     existing_intervals: list[Interval] = []
     for ev in existing_events:
         existing_intervals.extend(_event_to_intervals(ev, start_utc, window_end))
 
     conflicts = detect_conflicts_for_event(new_intervals, existing_intervals)
 
+    # The event is committed before Zoom is called, so a Zoom failure only
+    # costs the meeting link, never the event.
     db.commit()
     db.refresh(event)
 
+    zoom_error = None
+    if body.create_zoom_meeting:
+        zoom_error = zoom_meetings.create_meeting(db, user, event)
+
     return {
-        "event": EventResponse(
-            id=event.id, title=event.title,
-            start=event.start_utc.isoformat() + "Z",
-            end=event.end_utc.isoformat() + "Z",
-            timezone=event.timezone, is_recurring=event.is_recurring,
-        ),
+        "event": _event_response(event),
         "conflicts": conflicts,
+        "zoom_error": zoom_error,
     }
+
+
+def _repeat_create_result(db: Session, user: User, event: Event, body: EventCreate) -> dict:
+    """Answer a retried create with the event the first request saved."""
+    zoom_error = None
+    if body.create_zoom_meeting:
+        # No-op when the first request created the meeting or is still creating it;
+        # retries the meeting when the first attempt failed.
+        zoom_error = zoom_meetings.create_meeting(db, user, event)
+    return {"event": _event_response(event), "conflicts": [], "zoom_error": zoom_error}
 
 
 # ── GET /events ─────────────────────────────────────────────────────────────
@@ -177,6 +236,7 @@ def get_events(
     end: str = Query(..., description="ISO date or datetime"),
     tz: str = Query("UTC"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     # Parse range
     try:
@@ -195,21 +255,16 @@ def get_events(
 
     # Non-recurring: SQL overlap query
     single_events = (
-        db.query(Event)
+        _owned_events(db, user)
         .filter(Event.is_recurring == False, Event.start_utc < end_utc, Event.end_utc > start_utc)
         .all()
     )
     for ev in single_events:
-        results.append(EventResponse(
-            id=ev.id, title=ev.title,
-            start=ev.start_utc.isoformat() + "Z",
-            end=ev.end_utc.isoformat() + "Z",
-            timezone=ev.timezone, is_recurring=False,
-        ))
+        results.append(_event_response(ev))
 
     # Recurring: expand each one
     recurring_events = (
-        db.query(Event)
+        _owned_events(db, user)
         .filter(Event.is_recurring == True, Event.start_utc <= end_utc)
         .all()
     )
@@ -222,11 +277,15 @@ def get_events(
 
 # ── PUT /events/:id ─────────────────────────────────────────────────────────
 
-@router.put("/events/{event_id}")
-def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+@router.put("/events/{event_id}", response_model=EventMutationResponse)
+def update_event(
+    event_id: int,
+    body: EventUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, user)
+    before = (event.title, event.start_utc, event.end_utc)
 
     if body.title is not None:
         event.title = body.title
@@ -237,21 +296,34 @@ def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)
 
     db.commit()
     db.refresh(event)
-    return EventResponse(
-        id=event.id, title=event.title,
-        start=event.start_utc.isoformat() + "Z",
-        end=event.end_utc.isoformat() + "Z",
-        timezone=event.timezone, is_recurring=event.is_recurring,
-    )
+
+    changed = before != (event.title, event.start_utc, event.end_utc)
+    zoom_error = _sync_zoom(db, user, event, body.create_zoom_meeting, changed)
+    return _event_response(event, EventMutationResponse, zoom_error=zoom_error)
+
+
+def _sync_zoom(db: Session, user: User, event: Event, create_zoom_meeting, changed: bool):
+    """Apply the Zoom toggle and push title/time edits to an existing meeting."""
+    if create_zoom_meeting is False:
+        return zoom_meetings.delete_meeting(db, user, event)
+    if create_zoom_meeting and not zoom_meetings.has_meeting(event):
+        return zoom_meetings.create_meeting(db, user, event)
+    if changed:
+        return zoom_meetings.update_meeting(db, user, event)
+    return None
 
 
 # ── PUT /events/:id/occurrence/:date ────────────────────────────────────────
 
 @router.put("/events/{event_id}/occurrence/{date_str}")
-def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def update_occurrence(
+    event_id: int,
+    date_str: str,
+    body: OccurrenceUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -276,16 +348,21 @@ def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: 
         exc.end_utc = localize_and_convert(body.end, event.timezone)
 
     db.commit()
+    # A series shares one Zoom meeting with no fixed time, so moving or renaming
+    # a single occurrence leaves the meeting (and its link) as it is.
     return {"status": "ok", "original_date": date_str}
 
 
 # ── PUT /events/:id/series ──────────────────────────────────────────────────
 
-@router.put("/events/{event_id}/series")
-def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+@router.put("/events/{event_id}/series", response_model=EventMutationResponse)
+def update_series(
+    event_id: int,
+    body: SeriesUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -298,25 +375,36 @@ def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_d
     if body.end is not None:
         updates["end"] = body.end
 
+    had_meeting = zoom_meetings.has_meeting(event)
+    before = (event.title, event.start_utc, event.end_utc)
     new_event = split_series(db, event, split_date, updates)
     db.commit()
     db.refresh(new_event)
 
-    return EventResponse(
-        id=new_event.id, title=new_event.title,
-        start=new_event.start_utc.isoformat() + "Z",
-        end=new_event.end_utc.isoformat() + "Z",
-        timezone=new_event.timezone, is_recurring=new_event.is_recurring,
-    )
+    if new_event.id == event.id:
+        # Split at the first occurrence: the series was edited in place.
+        changed = before != (new_event.title, new_event.start_utc, new_event.end_utc)
+        zoom_error = _sync_zoom(db, user, new_event, body.create_zoom_meeting, changed)
+    elif body.create_zoom_meeting or (body.create_zoom_meeting is None and had_meeting):
+        # The original series keeps its meeting for the occurrences before the
+        # split; the new series gets its own so deleting either is independent.
+        zoom_error = zoom_meetings.create_meeting(db, user, new_event)
+    else:
+        zoom_error = None
+
+    return _event_response(new_event, EventMutationResponse, zoom_error=zoom_error)
 
 
 # ── DELETE /events/:id/occurrence/:date ─────────────────────────────────────
 
 @router.delete("/events/{event_id}/occurrence/{date_str}")
-def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def delete_occurrence(
+    event_id: int,
+    date_str: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, user)
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
 
@@ -345,11 +433,16 @@ def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db
 # ── DELETE /events/:id ──────────────────────────────────────────────────────
 
 @router.delete("/events/{event_id}")
-def delete_event(event_id: int, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
-        raise HTTPException(404, "Event not found")
+def delete_event(
+    event_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    event = _get_owned_event(db, event_id, user)
+    # Deleting the event is what the user asked for, so it proceeds even when
+    # Zoom can't be reached; zoom_error tells them the meeting still exists.
+    zoom_error = zoom_meetings.delete_meeting(db, user, event)
 
     db.delete(event)
     db.commit()
-    return {"status": "deleted"}
+    return {"status": "deleted", "zoom_error": zoom_error}

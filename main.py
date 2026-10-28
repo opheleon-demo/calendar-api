@@ -18,6 +18,8 @@ async def lifespan(app: FastAPI):
     validate_auth_config()
 
     Base.metadata.create_all(bind=engine)
+    from migrations import upgrade
+    upgrade(engine)
     db = SessionLocal()
     try:
         from models import Event

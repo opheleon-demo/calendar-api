@@ -27,6 +27,9 @@ export ZOOM_TOKEN_ENCRYPTION_KEY="$(python3 -c 'from cryptography.fernet import 
 # export FRONTEND_URL="http://localhost:5173"
 ```
 
+The Zoom app needs the `meeting:write` scope (plus `user:read`) so events can
+create, update and delete meetings on the organizer's account.
+
 Tokens are encrypted at rest with `ZOOM_TOKEN_ENCRYPTION_KEY`; rotating that key
 puts existing connections into the reconnect state. Without these variables the
 API runs normally and reports Zoom as not configured.
@@ -42,13 +45,16 @@ pytest
 
 - `POST /auth/register` — Create a user and receive a bearer JWT
 - `POST /auth/login` — Login and receive a bearer JWT
-- `POST /events` — Create event (+ optional recurrence)
+- `POST /events` — Create event (+ optional recurrence). `create_zoom_meeting: true` adds a Zoom meeting; send an `idempotency_key` so retries and double submits create one event and one meeting. The response carries `zoom_error` (`not_connected`, `reconnect_required`, `zoom_unavailable`, `zoom_error`) when the event saved but the link was not created
 - `GET /events?start=DATE&end=DATE&tz=TZ` — Query events in range
-- `PUT /events/:id` — Edit a single event
+- `PUT /events/:id` — Edit a single event. Title/time edits update its Zoom meeting; `create_zoom_meeting: true|false` adds or removes one
 - `PUT /events/:id/occurrence/:date` — Edit one occurrence of a recurring event
 - `PUT /events/:id/series` — Edit series from a date forward
 - `DELETE /events/:id/occurrence/:date` — Delete one occurrence
-- `DELETE /events/:id` — Delete event or entire series
+- `DELETE /events/:id` — Delete event or entire series (and its Zoom meeting)
+
+Events belong to the user who created them; every `/events` endpoint only sees
+the signed-in user's events. Event responses include `zoom_join_url`.
 
 - `GET /zoom/authorize` — Get the Zoom consent URL for the signed-in user
 - `GET /zoom/callback` — OAuth redirect target; sends the browser back to the UI with `?zoom=connected` or `?zoom=error&zoom_reason=denied|invalid_state|exchange_failed`

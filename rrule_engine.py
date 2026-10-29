@@ -50,7 +50,7 @@ class RRule:
 def expand(rule: RRule, ws: dt.datetime, we: dt.datetime) -> list[dt.datetime]:
     """Expand RRULE into occurrences within [ws, we). Skip-ahead, never iterates from dtstart."""
     gen = {"DAILY": _daily, "WEEKLY": _weekly, "MONTHLY": _monthly, "YEARLY": _yearly}[rule.freq]
-    eff_end = min(we, rule.until + dt.timedelta(days=1)) if rule.until else we
+    eff_end = min(we, rule.until + dt.timedelta(microseconds=1)) if rule.until else we
     raw = gen(rule, ws, eff_end)
     if rule.count is not None:
         pre = len(gen(rule, rule.dtstart, ws))

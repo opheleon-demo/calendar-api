@@ -7,14 +7,17 @@ the sweep line algorithm.
 """
 from __future__ import annotations
 import datetime as dt
+import json
+import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 
 from auth import get_current_user
 from database import get_db
 from models import (
-    Event, RecurrenceRule, RecurrenceException,
+    Event, RecurrenceRule, RecurrenceException, User, CreationRequest, EventMeeting,
     EventCreate, EventUpdate, OccurrenceUpdate, SeriesUpdate,
     EventResponse, ConflictInfo,
 )
@@ -60,6 +63,7 @@ def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) ->
 
     results = []
     for occ_local in occurrences:
+        resolved_start = event.start_utc if occ_local == local_start else local_to_utc(occ_local, tz_name).utc_dt
         occ_date = occ_local.date()
 
         if occ_date in exc_map:
@@ -67,7 +71,7 @@ def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) ->
             if exc.is_deleted:
                 continue
             # Modified occurrence
-            occ_start_utc = exc.start_utc if exc.start_utc else local_to_utc(occ_local, tz_name).utc_dt
+            occ_start_utc = exc.start_utc if exc.start_utc else resolved_start
             occ_end_utc = exc.end_utc if exc.end_utc else occ_start_utc + duration
             occ_title = exc.title if exc.title else event.title
             results.append(EventResponse(
@@ -78,7 +82,7 @@ def _expand_event(event: Event, start_utc: dt.datetime, end_utc: dt.datetime) ->
                 original_date=occ_date.isoformat(), is_exception=True,
             ))
         else:
-            occ_utc = local_to_utc(occ_local, tz_name).utc_dt
+            occ_utc = resolved_start
             results.append(EventResponse(
                 id=event.id, title=event.title,
                 start=occ_utc.isoformat() + "Z",
@@ -110,63 +114,62 @@ def _event_to_intervals(event: Event, start_utc: dt.datetime, end_utc: dt.dateti
 # ── POST /events ────────────────────────────────────────────────────────────
 
 @router.post("/events")
-def create_event(body: EventCreate, db: Session = Depends(get_db)):
-    tz_name = body.timezone
-    start_utc = localize_and_convert(body.start, tz_name)
-    end_utc = localize_and_convert(body.end, tz_name)
-
-    event = Event(
-        title=body.title,
-        start_utc=start_utc,
-        end_utc=end_utc,
-        timezone=tz_name,
-        is_recurring=body.recurrence is not None,
-    )
+def create_event(body: EventCreate, db: Session = Depends(get_db),
+                 user: User = Depends(get_current_user),
+                 idempotency_key: str = Header(..., alias="Idempotency-Key")):
+    from provisioning import prepare, provision, resolve_schedule
+    from zoom import failure, lock
+    try:
+        idempotency_key = str(uuid.UUID(idempotency_key))
+    except ValueError:
+        raise failure("invalid_request_key", "Idempotency-Key must be a UUID.", 422)
+    start_utc, end_utc, schedule = resolve_schedule(body)
+    request, connection, token, replay = prepare(db, user.id, body, idempotency_key, schedule)
+    if replay is not None:
+        return replay
+    request_id, organizer_id = request.id, user.id
+    provision(db, request, connection, token, body.title)
+    lock(db)
+    request = db.get(CreationRequest, request_id)
+    if request.response_json:
+        result = json.loads(request.response_json)
+        db.commit()
+        return result
+    meetings = db.query(EventMeeting).filter_by(request_id=request.id).order_by(EventMeeting.start_utc).all()
+    if not meetings or any(meeting.state != "ready" for meeting in meetings):
+        raise failure("zoom_outcome_uncertain", "Meeting creation is pending. Retry this same draft.")
+    event = Event(title=body.title, organizer_id=organizer_id, start_utc=start_utc, end_utc=end_utc,
+                  timezone=body.timezone, is_recurring=body.recurrence is not None)
     db.add(event)
     db.flush()
-
     if body.recurrence:
         r = body.recurrence
-        until_utc = None
-        if r.until:
-            until_utc = localize_and_convert(r.until + "T23:59:59", tz_name)
-        rule = RecurrenceRule(
-            event_id=event.id,
-            freq=r.freq.upper(),
-            interval=r.interval,
-            count=r.count,
-            until_utc=until_utc,
-            byday=r.byday,
-            bymonthday=r.bymonthday,
-            bymonth=r.bymonth,
-        )
-        db.add(rule)
-
+        db.add(RecurrenceRule(event_id=event.id, freq=r.freq.upper(), interval=r.interval,
+                             count=r.count, until_utc=localize_and_convert(r.until + "T23:59:59", body.timezone) if r.until else None,
+                             byday=r.byday, bymonthday=r.bymonthday, bymonth=r.bymonth))
+    for meeting in meetings:
+        meeting.event_id = event.id
     db.flush()
-
-    # Conflict detection: check first 90 days
     window_end = start_utc + dt.timedelta(days=90)
     new_intervals = _event_to_intervals(event, start_utc, window_end)
-
-    existing_events = db.query(Event).filter(Event.id != event.id).all()
-    existing_intervals: list[Interval] = []
-    for ev in existing_events:
-        existing_intervals.extend(_event_to_intervals(ev, start_utc, window_end))
-
+    existing_events = db.query(Event).filter(Event.id != event.id, or_(Event.organizer_id == organizer_id, Event.organizer_id.is_(None))).all()
+    existing_intervals = []
+    for existing in existing_events:
+        existing_intervals.extend(_event_to_intervals(existing, start_utc, window_end))
     conflicts = detect_conflicts_for_event(new_intervals, existing_intervals)
-
+    result = {"event": EventResponse(id=event.id, title=event.title,
+              start=event.start_utc.isoformat() + "Z", end=event.end_utc.isoformat() + "Z",
+              timezone=event.timezone, is_recurring=event.is_recurring,
+              organizer_id=organizer_id, zoom_meeting_id=meetings[0].meeting_id,
+              zoom_join_url=meetings[0].join_url, zoom_host_id=meetings[0].host_id).model_dump(),
+              "conflicts": conflicts,
+              "meetings": [{"start": m.start_utc.isoformat() + "Z", "end": m.end_utc.isoformat() + "Z",
+                            "zoom_meeting_id": m.meeting_id, "zoom_join_url": m.join_url,
+                            "zoom_host_id": m.host_id} for m in meetings]}
+    request.event_id = event.id
+    request.response_json = json.dumps(result)
     db.commit()
-    db.refresh(event)
-
-    return {
-        "event": EventResponse(
-            id=event.id, title=event.title,
-            start=event.start_utc.isoformat() + "Z",
-            end=event.end_utc.isoformat() + "Z",
-            timezone=event.timezone, is_recurring=event.is_recurring,
-        ),
-        "conflicts": conflicts,
-    }
+    return result
 
 
 # ── GET /events ─────────────────────────────────────────────────────────────
@@ -177,6 +180,7 @@ def get_events(
     end: str = Query(..., description="ISO date or datetime"),
     tz: str = Query("UTC"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     # Parse range
     try:
@@ -196,7 +200,7 @@ def get_events(
     # Non-recurring: SQL overlap query
     single_events = (
         db.query(Event)
-        .filter(Event.is_recurring == False, Event.start_utc < end_utc, Event.end_utc > start_utc)
+        .filter(or_(Event.organizer_id == user.id, Event.organizer_id.is_(None)), Event.is_recurring == False, Event.start_utc < end_utc, Event.end_utc > start_utc)
         .all()
     )
     for ev in single_events:
@@ -210,12 +214,26 @@ def get_events(
     # Recurring: expand each one
     recurring_events = (
         db.query(Event)
-        .filter(Event.is_recurring == True, Event.start_utc <= end_utc)
+        .filter(or_(Event.organizer_id == user.id, Event.organizer_id.is_(None)), Event.is_recurring == True, Event.start_utc <= end_utc)
         .all()
     )
     for ev in recurring_events:
         results.extend(_expand_event(ev, start_utc, end_utc))
 
+    # Association is occurrence-specific; legacy and later edited/split events are never provisioned here.
+    event_ids = {result.id for result in results}
+    meetings = db.query(EventMeeting).filter(EventMeeting.event_id.in_(event_ids)).all() if event_ids else []
+    event_zones = {event.id: event.timezone for event in single_events + recurring_events}
+    by_occurrence = {(meeting.event_id, utc_to_local(meeting.start_utc, event_zones[meeting.event_id]).date().isoformat()): meeting for meeting in meetings}
+    by_event = {meeting.event_id: meeting for meeting in meetings}
+    owners = {event.id: event.organizer_id for event in single_events + recurring_events}
+    for result in results:
+        result.organizer_id = owners[result.id]
+        meeting = by_occurrence.get((result.id, result.original_date)) if result.is_recurring else by_event.get(result.id)
+        if meeting:
+            result.zoom_meeting_id = meeting.meeting_id
+            result.zoom_join_url = meeting.join_url
+            result.zoom_host_id = meeting.host_id
     results.sort(key=lambda r: r.start)
     return results
 
@@ -223,9 +241,9 @@ def get_events(
 # ── PUT /events/:id ─────────────────────────────────────────────────────────
 
 @router.put("/events/{event_id}")
-def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
+def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    event = db.get(Event, event_id)
+    if not event or (event.organizer_id is not None and event.organizer_id != user.id):
         raise HTTPException(404, "Event not found")
 
     if body.title is not None:
@@ -248,9 +266,9 @@ def update_event(event_id: int, body: EventUpdate, db: Session = Depends(get_db)
 # ── PUT /events/:id/occurrence/:date ────────────────────────────────────────
 
 @router.put("/events/{event_id}/occurrence/{date_str}")
-def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
+def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    event = db.get(Event, event_id)
+    if not event or (event.organizer_id is not None and event.organizer_id != user.id):
         raise HTTPException(404, "Event not found")
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
@@ -282,9 +300,9 @@ def update_occurrence(event_id: int, date_str: str, body: OccurrenceUpdate, db: 
 # ── PUT /events/:id/series ──────────────────────────────────────────────────
 
 @router.put("/events/{event_id}/series")
-def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
+def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    event = db.get(Event, event_id)
+    if not event or (event.organizer_id is not None and event.organizer_id != user.id):
         raise HTTPException(404, "Event not found")
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
@@ -313,9 +331,9 @@ def update_series(event_id: int, body: SeriesUpdate, db: Session = Depends(get_d
 # ── DELETE /events/:id/occurrence/:date ─────────────────────────────────────
 
 @router.delete("/events/{event_id}/occurrence/{date_str}")
-def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
+def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    event = db.get(Event, event_id)
+    if not event or (event.organizer_id is not None and event.organizer_id != user.id):
         raise HTTPException(404, "Event not found")
     if not event.is_recurring:
         raise HTTPException(400, "Event is not recurring")
@@ -345,11 +363,12 @@ def delete_occurrence(event_id: int, date_str: str, db: Session = Depends(get_db
 # ── DELETE /events/:id ──────────────────────────────────────────────────────
 
 @router.delete("/events/{event_id}")
-def delete_event(event_id: int, db: Session = Depends(get_db)):
-    event = db.query(Event).get(event_id)
-    if not event:
+def delete_event(event_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    event = db.get(Event, event_id)
+    if not event or (event.organizer_id is not None and event.organizer_id != user.id):
         raise HTTPException(404, "Event not found")
 
+    db.query(EventMeeting).filter_by(event_id=event.id).update({"event_id": None})
     db.delete(event)
     db.commit()
     return {"status": "deleted"}

@@ -18,6 +18,7 @@ class Base(DeclarativeBase):
 class Event(Base):
     __tablename__ = "events"
     id = Column(Integer, primary_key=True, autoincrement=True)
+    organizer_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
     title = Column(String, nullable=False)
     start_utc = Column(DateTime, nullable=False)
     end_utc = Column(DateTime, nullable=False)
@@ -76,8 +77,8 @@ class RecurrenceException(Base):
 
 class RecurrenceRuleSchema(BaseModel):
     freq: str                        # DAILY, WEEKLY, MONTHLY, YEARLY
-    interval: int = 1
-    count: Optional[int] = None
+    interval: int = Field(default=1, ge=1, le=52)
+    count: Optional[int] = Field(default=None, ge=1, le=60)
     until: Optional[str] = None      # ISO date string
     byday: Optional[str] = None
     bymonthday: Optional[str] = None
@@ -85,7 +86,7 @@ class RecurrenceRuleSchema(BaseModel):
 
 
 class EventCreate(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=200)
     start: str                       # ISO 8601 datetime
     end: str
     timezone: str = "UTC"
@@ -136,6 +137,10 @@ class EventResponse(BaseModel):
     is_recurring: bool
     original_date: Optional[str] = None
     is_exception: bool = False
+    organizer_id: Optional[int] = None
+    zoom_meeting_id: Optional[str] = None
+    zoom_join_url: Optional[str] = None
+    zoom_host_id: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -146,3 +151,47 @@ class ConflictInfo(BaseModel):
     title: str
     start: str
     end: str
+
+
+class ZoomConnection(Base):
+    __tablename__ = "zoom_connections"
+    organizer_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    zoom_user_id = Column(String, nullable=False)
+    access_token = Column(String, nullable=False)
+    refresh_token = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    usable = Column(Boolean, nullable=False, default=True)
+
+
+class ZoomOAuthState(Base):
+    __tablename__ = "zoom_oauth_states"
+    digest = Column(String, primary_key=True)
+    organizer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    browser_digest = Column(String, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+
+class CreationRequest(Base):
+    __tablename__ = "creation_requests"
+    id = Column(String, primary_key=True)
+    organizer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    request_key = Column(String, nullable=False)
+    fingerprint = Column(String, nullable=False)
+    zoom_user_id = Column(String, nullable=False)
+    event_id = Column(Integer, nullable=True)  # retained even after event deletion
+    response_json = Column(String, nullable=True)
+    __table_args__ = (UniqueConstraint("organizer_id", "request_key"),)
+
+
+class EventMeeting(Base):
+    __tablename__ = "event_meetings"
+    id = Column(String, primary_key=True)  # durable opaque marker, included in Zoom agenda
+    request_id = Column(String, ForeignKey("creation_requests.id"), nullable=False)
+    event_id = Column(Integer, ForeignKey("events.id"), nullable=True, index=True)
+    start_utc = Column(DateTime, nullable=False)
+    end_utc = Column(DateTime, nullable=False)
+    state = Column(String, nullable=False, default="new")
+    meeting_id = Column(String, nullable=True)
+    join_url = Column(String, nullable=True)
+    host_id = Column(String, nullable=True)
+    __table_args__ = (UniqueConstraint("request_id", "start_utc"),)

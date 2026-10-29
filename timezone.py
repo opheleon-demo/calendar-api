@@ -137,5 +137,7 @@ def local_to_utc(local_naive: dt.datetime, tz_name: str, prefer_dst: bool = True
 def localize_and_convert(naive_iso: str, tz_name: str) -> dt.datetime:
     """Parse an ISO string as local time in tz_name, return UTC naive datetime."""
     local_naive = dt.datetime.fromisoformat(naive_iso)
+    if local_naive.tzinfo is not None:
+        return local_naive.astimezone(dt.timezone.utc).replace(tzinfo=None)
     result = local_to_utc(local_naive, tz_name)
     return result.utc_dt

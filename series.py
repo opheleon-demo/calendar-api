@@ -92,6 +92,7 @@ def split_series(
 
     new_event = Event(
         title=new_title,
+        organizer_id=event.organizer_id,
         start_utc=new_start_utc,
         end_utc=new_end_utc,
         timezone=tz_name,

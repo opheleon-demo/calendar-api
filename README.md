@@ -26,3 +26,22 @@ Seeds sample events automatically on first run.
 - `DELETE /events/:id` — Delete event or entire series
 
 All `/events` endpoints require `Authorization: Bearer <token>`.
+
+## Availability
+
+`GET /health` is public and returns HTTP 200 with `Content-Type: application/json`
+and exactly `{"status":"ok"}`. It does not require a bearer token or query the
+database, and it returns no user, event, credential, or configuration data. This
+checks API availability only, not database readiness. Startup still requires the
+normal `JWT_SECRET_KEY` configuration.
+
+## Local checks
+
+```bash
+pip install -r requirements-dev.txt
+python3 -m unittest discover -s tests -v
+```
+
+Tests use an isolated in-memory SQLite database and do not seed or modify
+`calendar.db`. They cover the public health response and UI-origin CORS, plus
+authentication, protected event access, event CRUD, and recurring operations.

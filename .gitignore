@@ -2,3 +2,5 @@ node_modules/
 dist/
 .env
 
+# Python test and import artifacts
+__pycache__/
